@@ -18,6 +18,15 @@ const CODE_EXTENSIONS = new Set([
 
 const TEST_PATTERNS = [/test_.*\.py$/, /.*_test\.py$/, /.*\.test\.[tj]sx?$/, /.*\.spec\.[tj]sx?$/, /.*_test\.go$/, /.*_test\.rs$/];
 const EDIT_EXTENSIONS = new Set([".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".rs"]);
+const CC_COMMAND_PREFIXES = [
+  "/cc-check-deps",
+  "/cc-status",
+  "/cc-migrate-rustdex",
+  "/cc-setup",
+  "/cc-create-handoff",
+  "/cc-install-agents",
+  "/cc-rollover",
+] as const;
 
 function isCodeFile(filePath: string): boolean {
   return CODE_EXTENSIONS.has(extname(filePath));
@@ -118,6 +127,18 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
       ctx.ui.notify(warning, "warning");
     }
 
+  });
+
+  pi.on("input", async (event, ctx) => {
+    if (event.source === "extension") return { action: "continue" as const };
+    const text = event.text?.trim() ?? "";
+    if (!CC_COMMAND_PREFIXES.some((prefix) => text === prefix || text.startsWith(`${prefix} `))) {
+      return { action: "continue" as const };
+    }
+
+    ctx.ui.notify(`Continuous Claude Pi rerouting ${text.split(/\s+/, 1)[0]} through extension command fallback.`, "info");
+    pi.sendUserMessage(text);
+    return { action: "handled" as const };
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {

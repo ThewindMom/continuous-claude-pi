@@ -52,7 +52,7 @@ export const DEFAULT_CONFIG: ContinuousClaudePiConfig = {
   },
   autoRollover: {
     enabled: true,
-    thresholdTokens: 160_000,
+    thresholdTokens: 64_000,
     cooldownMs: 60_000,
   },
 };

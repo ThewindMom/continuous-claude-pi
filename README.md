@@ -185,7 +185,7 @@ Flow:
 
 Default auto-rollover config:
 - enabled: `true`
-- threshold: `160000` tokens
+- threshold: `64000` tokens
 - cooldown: `60000` ms
 
 ## Validation plan
