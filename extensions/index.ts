@@ -103,6 +103,34 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
     return prompt ?? `Resume from handoff ${handoffPath}. Read it first, then continue autonomously from the next bounded step.`;
   }
 
+  function shouldAutoRollover(sessionFile: string | undefined, tokens: number | undefined): sessionFile is string {
+    if (!sessionFile || !configInfo.config.autoRollover.enabled) return false;
+    if (autoRolledOverSessions.has(sessionFile)) return false;
+    if ((loadRolloverGuard()?.expiresAt ?? 0) > Date.now()) return false;
+    if (tokens === undefined || tokens < configInfo.config.autoRollover.thresholdTokens) return false;
+    return true;
+  }
+
+  function prepareAutoRollover(sessionFile: string, description = "auto-rollover") {
+    const handoff = createHandoffFromSession({
+      cwd: activeCwd,
+      config: configInfo.config,
+      sessionFile,
+      description,
+    });
+    autoRolledOverSessions.add(sessionFile);
+    saveRolloverGuard({ expiresAt: Date.now() + configInfo.config.autoRollover.cooldownMs });
+    return handoff;
+  }
+
+  function queueRolloverCommand(handoffPath: string, deliverAs?: "steer" | "followUp") {
+    if (deliverAs) {
+      pi.sendUserMessage(`/cc-rollover ${handoffPath}`, { deliverAs });
+      return;
+    }
+    pi.sendUserMessage(`/cc-rollover ${handoffPath}`);
+  }
+
   function setFooterStatus(ctx: { ui?: { setStatus?: (key: string, value?: string) => void } }) {
     const requiredOkay = dependencyStatus.missingRequired.length === 0;
     const statusText = requiredOkay
@@ -158,29 +186,24 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
     return { systemPrompt: `${_event.systemPrompt}\n\n${note}` };
   });
 
+  pi.on("turn_end", async (_event, ctx) => {
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    const usage = ctx.getContextUsage();
+    if (!shouldAutoRollover(sessionFile, usage?.tokens)) return;
+
+    const handoff = prepareAutoRollover(sessionFile);
+    ctx.ui.notify(`Continuous Claude Pi auto-rollover queued before compaction: ${handoff.path}`, "warning");
+    queueRolloverCommand(handoff.path, "steer");
+  });
+
   pi.on("agent_end", async (_event, ctx) => {
     const sessionFile = ctx.sessionManager.getSessionFile();
-    if (!sessionFile || !configInfo.config.autoRollover.enabled) return;
-    if (autoRolledOverSessions.has(sessionFile)) return;
-
-    const guard = loadRolloverGuard();
-    if ((guard?.expiresAt ?? 0) > Date.now()) return;
-
     const usage = ctx.getContextUsage();
-    if (!usage || usage.tokens < configInfo.config.autoRollover.thresholdTokens) return;
+    if (!shouldAutoRollover(sessionFile, usage?.tokens)) return;
 
-    const handoff = createHandoffFromSession({
-      cwd: activeCwd,
-      config: configInfo.config,
-      sessionFile,
-      description: "auto-rollover",
-    });
-
-    autoRolledOverSessions.add(sessionFile);
-    saveRolloverGuard({ expiresAt: Date.now() + configInfo.config.autoRollover.cooldownMs });
-
+    const handoff = prepareAutoRollover(sessionFile);
     ctx.ui.notify(`Continuous Claude Pi auto-rollover: created ${handoff.path}`, "warning");
-    pi.sendUserMessage(`/cc-rollover ${handoff.path}`);
+    queueRolloverCommand(handoff.path);
   });
 
   pi.on("tool_call", async (event) => {
@@ -269,10 +292,17 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
     };
   });
 
-  pi.on("session_before_compact", async (_event, ctx) => {
+  pi.on("session_before_compact", async (event, ctx) => {
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (!sessionFile) return {};
     try {
+      if (shouldAutoRollover(sessionFile, event.preparation?.tokensBefore)) {
+        const handoff = prepareAutoRollover(sessionFile);
+        ctx.ui.notify(`Continuous Claude Pi cancelled compaction and queued rollover: ${handoff.path}`, "warning");
+        queueRolloverCommand(handoff.path, "followUp");
+        return { cancel: true };
+      }
+
       const handoff = createHandoffFromSession({ cwd: activeCwd, config: configInfo.config, sessionFile, description: "pre-compact-auto" });
       ctx.ui.notify(`Continuous Claude Pi wrote pre-compact handoff: ${handoff.path}`, "info");
     } catch (error) {
