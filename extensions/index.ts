@@ -1,4 +1,5 @@
-import { existsSync, readdirSync, statSync, copyFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, copyFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -71,6 +72,7 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
   let activeCwd = process.cwd();
   let dependencyStatus = checkDependencies();
   let configInfo = loadConfig(activeCwd);
+  const processedDiagnosticsToolCalls = new Set<string>();
 
   function refreshState(cwd: string) {
     activeCwd = cwd;
@@ -125,51 +127,85 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
     const input = event.input as Record<string, unknown>;
     const path = typeof input.path === "string" ? resolveMaybeRelative(activeCwd, input.path) : "";
     if (!path || shouldBypassRead(path, input, configInfo.config.readAssist.smallFileBytes)) return {};
+
     input.limit = configInfo.config.readAssist.lineLimit;
+
+    const nav = buildNavMapForFile(path, activeCwd);
+    if (!nav) return {};
+
+    const raw = readFileSync(path, "utf8");
+    const excerpt = raw.split(/\r?\n/).slice(0, configInfo.config.readAssist.lineLimit).join("\n");
+    const overlayDir = join(tmpdir(), "continuous-claude-pi-read-assist");
+    mkdirSync(overlayDir, { recursive: true });
+    const overlayPath = join(overlayDir, `${basename(path).replace(/[^a-zA-Z0-9._-]/g, "_")}-${process.pid}-${Date.now()}.txt`);
+    const overlay = [
+      "[CC read assist]",
+      nav.navMap,
+      "",
+      "---",
+      excerpt,
+    ].join("\n");
+    writeFileSync(overlayPath, overlay, "utf8");
+    input.path = overlayPath;
     return {};
   });
 
-  pi.on("tool_result", async (event, ctx) => {
-    if (event.toolName === "read" && configInfo.config.readAssist.enabled) {
-      const input = event.input as Record<string, unknown>;
-      const path = typeof input.path === "string" ? resolveMaybeRelative(activeCwd, input.path) : "";
-      if (!path || shouldBypassRead(path, input, configInfo.config.readAssist.smallFileBytes)) return {};
-      const nav = buildNavMapForFile(path, activeCwd);
-      if (!nav) return {};
-      const original = textFromContentBlocks(event.content as any);
-      const text = `[CC read assist]\n${nav.navMap}\n\n---\n${original}`;
-      return {
-        content: [{ type: "text", text: trimTo(text, 24_000) }],
-        details: { ...(event.details as Record<string, unknown> | undefined), ccReadAssist: { navTitle: nav.title, truncatedTo: configInfo.config.readAssist.lineLimit } },
-      };
-    }
-
-    if ((event.toolName === "write" || event.toolName === "edit") && configInfo.config.diagnostics.enabled && commandExists("tldr")) {
-      const input = event.input as Record<string, unknown>;
-      const targetPath = typeof input.path === "string" ? resolveMaybeRelative(activeCwd, input.path) : "";
-      if (!targetPath || !EDIT_EXTENSIONS.has(extname(targetPath))) return {};
-      const diagnostics = runTldr({ command: "diagnostics", target: targetPath, format: "json" }, activeCwd);
-      if (!diagnostics.ok) return {};
-      const summary = typeof diagnostics.details === "object" && diagnostics.details !== null ? diagnostics.details as Record<string, any> : undefined;
-      const errors = Array.isArray(summary?.errors) ? summary?.errors.slice(0, 5) : [];
-      const lines = [
-        `Diagnostics summary for ${basename(targetPath)}:`,
-        `- type errors: ${summary?.summary?.type_errors ?? summary?.type_errors ?? 0}`,
-        `- lint issues: ${summary?.summary?.lint_errors ?? summary?.summary?.lint_issues ?? summary?.lint_errors ?? summary?.lint_issues ?? 0}`,
-      ];
-      for (const error of errors) {
-        const loc = [error.file ? basename(error.file) : basename(targetPath), error.line, error.column].filter(Boolean).join(":");
-        lines.push(`- ${loc || basename(targetPath)} ${error.message ?? JSON.stringify(error)}`);
-      }
-      const diagnosticsText = lines.join("\n");
-      ctx.ui.notify(trimTo(diagnosticsText, 800), errors.length > 0 ? "warning" : "info");
-      return {
-        content: appendDiagnosticsText(event.content as any, diagnosticsText),
-        details: { ...(event.details as Record<string, unknown> | undefined), ccDiagnostics: summary ?? diagnosticsText },
-      };
-    }
-
+  pi.on("tool_result", async (_event, _ctx) => {
     return {};
+  });
+
+  pi.on("context", async (event) => {
+    if (!configInfo.config.diagnostics.enabled || !commandExists("tldr")) return {};
+
+    const messages = event.messages as any[];
+    const last = messages.at(-1);
+    if (!last || last.role !== "toolResult") return {};
+    if ((last.toolName !== "write" && last.toolName !== "edit") || !last.toolCallId) return {};
+    if (processedDiagnosticsToolCalls.has(last.toolCallId)) return {};
+
+    let targetPath = "";
+    for (let index = messages.length - 2; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (message?.role !== "assistant" || !Array.isArray(message.content)) continue;
+      const toolCall = message.content.find((part: any) => part?.type === "toolCall" && part?.id === last.toolCallId && (part?.name === "write" || part?.name === "edit"));
+      if (toolCall?.arguments?.path && typeof toolCall.arguments.path === "string") {
+        targetPath = resolveMaybeRelative(activeCwd, toolCall.arguments.path);
+        break;
+      }
+    }
+
+    if (!targetPath || !EDIT_EXTENSIONS.has(extname(targetPath))) {
+      processedDiagnosticsToolCalls.add(last.toolCallId);
+      return {};
+    }
+
+    const diagnostics = runTldr({ command: "diagnostics", target: targetPath, format: "json" }, activeCwd);
+    processedDiagnosticsToolCalls.add(last.toolCallId);
+    if (!diagnostics.ok) return {};
+
+    const summary = typeof diagnostics.details === "object" && diagnostics.details !== null ? diagnostics.details as Record<string, any> : undefined;
+    const errors = Array.isArray(summary?.errors) ? summary.errors.slice(0, 5) : [];
+    const lines = [
+      `[cc diagnostics] ${basename(targetPath)}`,
+      `- type errors: ${summary?.summary?.type_errors ?? summary?.type_errors ?? 0}`,
+      `- lint issues: ${summary?.summary?.lint_errors ?? summary?.summary?.lint_issues ?? summary?.lint_errors ?? summary?.lint_issues ?? 0}`,
+    ];
+    for (const error of errors) {
+      const loc = [error.file ? basename(error.file) : basename(targetPath), error.line, error.column].filter(Boolean).join(":");
+      lines.push(`- ${loc || basename(targetPath)} ${error.message ?? JSON.stringify(error)}`);
+    }
+    const diagnosticsText = lines.join("\n");
+
+    return {
+      messages: [
+        ...messages,
+        {
+          role: "system",
+          content: [{ type: "text", text: diagnosticsText }],
+          timestamp: Date.now(),
+        },
+      ],
+    };
   });
 
   pi.on("session_before_compact", async (_event, ctx) => {

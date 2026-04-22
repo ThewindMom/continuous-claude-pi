@@ -45,9 +45,9 @@ export function checkDependencies(): DependencyStatus {
     : false;
   checks.push({
     name: "tldr-semantic-feature",
-    required: true,
+    required: false,
     available: semanticAvailable,
-    note: "semantic search requires tldr installed with semantic support",
+    note: "recommended for `tldr semantic` / `similar`; prebuilt binaries usually omit it",
   });
 
   checks.push({

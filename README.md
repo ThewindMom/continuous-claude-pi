@@ -54,7 +54,11 @@ Intended v1 experience expects these on `PATH`:
 ### Important TLDR note
 
 Semantic search in `tldr-code` requires semantic support at install time.
-Per the upstream README, that means installing with semantic support rather than relying on a bare prebuilt binary.
+Per the upstream README, prebuilt binaries usually omit that feature.
+
+`continuous-claude-pi` now treats semantic search as a **recommended enhancement**, not a hard blocker:
+- core TLDR workflows still work with the standard release binary
+- `tldr semantic` / `tldr similar` need a custom semantic-enabled build
 
 ## Optional / soft-warning capabilities
 

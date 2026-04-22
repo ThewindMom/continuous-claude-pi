@@ -102,9 +102,15 @@ export function nowStamp(): { date: string; iso: string; fileTimestamp: string }
   return { date, iso, fileTimestamp };
 }
 
-export function textFromContentBlocks(content: Array<{ type: string; text?: string }> | undefined): string {
+export function textFromContentBlocks(content: unknown): string {
   if (!content) return "";
-  return content.filter((part) => part.type === "text" && typeof part.text === "string").map((part) => part.text ?? "").join("\n");
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part): part is { type?: string; text?: string } => Boolean(part) && typeof part === "object")
+    .filter((part) => part.type === "text" && typeof part.text === "string")
+    .map((part) => part.text ?? "")
+    .join("\n");
 }
 
 export function firstNonEmptyLine(text: string): string {
