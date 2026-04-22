@@ -96,6 +96,30 @@ export function readGoalNowFromHandoff(filePath: string | undefined): { goal?: s
   return { goal, now };
 }
 
+export function readNextSessionPromptFromHandoff(filePath: string | undefined): string | undefined {
+  if (!filePath || !existsSync(filePath)) return undefined;
+  const lines = readFileSync(filePath, "utf8").split(/\r?\n/);
+  const start = lines.findIndex((line) => line.trim() === "next_session_prompt: |");
+  if (start === -1) return undefined;
+
+  const block: string[] = [];
+  for (let index = start + 1; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    if (line.startsWith("  ")) {
+      block.push(line.slice(2));
+      continue;
+    }
+    if (!line.trim()) {
+      block.push("");
+      continue;
+    }
+    break;
+  }
+
+  const prompt = block.join("\n").trim();
+  return prompt || undefined;
+}
+
 export function createHandoffFromSession(params: {
   cwd: string;
   config: ContinuousClaudePiConfig;

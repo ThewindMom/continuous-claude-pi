@@ -5,12 +5,12 @@ import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { getAgentDir } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { DEFAULT_CONFIG, getProjectConfigPath, loadConfig } from "./config.js";
+import { DEFAULT_CONFIG, getAutoRolloverGuardPath, getProjectConfigPath, loadConfig } from "./config.js";
 import { checkDependencies, formatDependencyStatus } from "./deps.js";
-import { createHandoffFromSession, findLatestHandoffFile, readGoalNowFromHandoff } from "./handoff.js";
+import { createHandoffFromSession, findLatestHandoffFile, readGoalNowFromHandoff, readNextSessionPromptFromHandoff } from "./handoff.js";
 import { migrateRustDexSettings } from "./migration.js";
-import { appendDiagnosticsText, buildNavMapForFile, runTldr, tldrSchema } from "./tldr.js";
-import { commandExists, resolveMaybeRelative, runCommand, textFromContentBlocks, trimTo, tryParseJson, writeJsonFile, slugify } from "./utils.js";
+import { buildNavMapForFile, runTldr, tldrSchema } from "./tldr.js";
+import { commandExists, readJsonFile, resolveMaybeRelative, runCommand, textFromContentBlocks, trimTo, tryParseJson, writeJsonFile, slugify } from "./utils.js";
 
 const CODE_EXTENSIONS = new Set([
   ".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".go", ".rs", ".java", ".kt", ".c", ".cpp", ".cc", ".h", ".hpp", ".rb", ".php", ".swift", ".cs", ".scala", ".ex", ".exs", ".lua",
@@ -73,11 +73,25 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
   let dependencyStatus = checkDependencies();
   let configInfo = loadConfig(activeCwd);
   const processedDiagnosticsToolCalls = new Set<string>();
+  const autoRolledOverSessions = new Set<string>();
 
   function refreshState(cwd: string) {
     activeCwd = cwd;
     dependencyStatus = checkDependencies();
     configInfo = loadConfig(cwd);
+  }
+
+  function loadRolloverGuard(): { expiresAt?: number } | null {
+    return readJsonFile<{ expiresAt?: number } | null>(getAutoRolloverGuardPath(), null);
+  }
+
+  function saveRolloverGuard(data: { expiresAt: number } | null): void {
+    writeJsonFile(getAutoRolloverGuardPath(), data);
+  }
+
+  function buildResumePrompt(handoffPath: string): string {
+    const prompt = readNextSessionPromptFromHandoff(handoffPath);
+    return prompt ?? `Resume from handoff ${handoffPath}. Read it first, then continue autonomously from the next bounded step.`;
   }
 
   function setFooterStatus(ctx: { ui?: { setStatus?: (key: string, value?: string) => void } }) {
@@ -103,6 +117,7 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
     for (const warning of dependencyStatus.warnings) {
       ctx.ui.notify(warning, "warning");
     }
+
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
@@ -120,6 +135,31 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
     ].join(" ");
 
     return { systemPrompt: `${_event.systemPrompt}\n\n${note}` };
+  });
+
+  pi.on("agent_end", async (_event, ctx) => {
+    const sessionFile = ctx.sessionManager.getSessionFile();
+    if (!sessionFile || !configInfo.config.autoRollover.enabled) return;
+    if (autoRolledOverSessions.has(sessionFile)) return;
+
+    const guard = loadRolloverGuard();
+    if ((guard?.expiresAt ?? 0) > Date.now()) return;
+
+    const usage = ctx.getContextUsage();
+    if (!usage || usage.tokens < configInfo.config.autoRollover.thresholdTokens) return;
+
+    const handoff = createHandoffFromSession({
+      cwd: activeCwd,
+      config: configInfo.config,
+      sessionFile,
+      description: "auto-rollover",
+    });
+
+    autoRolledOverSessions.add(sessionFile);
+    saveRolloverGuard({ expiresAt: Date.now() + configInfo.config.autoRollover.cooldownMs });
+
+    ctx.ui.notify(`Continuous Claude Pi auto-rollover: created ${handoff.path}`, "warning");
+    pi.sendUserMessage(`/cc-rollover ${handoff.path}`);
   });
 
   pi.on("tool_call", async (event) => {
@@ -239,6 +279,7 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
         `Config path: ${configInfo.path}`,
         `Continuum root: ${resolve(activeCwd, configInfo.config.storage.continuumRoot)}`,
         `Thoughts/shared root: ${resolve(activeCwd, configInfo.config.storage.thoughtsSharedRoot)}`,
+        `Auto rollover: ${configInfo.config.autoRollover.enabled ? "on" : "off"} @ ${configInfo.config.autoRollover.thresholdTokens} tokens (cooldown ${configInfo.config.autoRollover.cooldownMs}ms)`,
         `Project config path: ${getProjectConfigPath(activeCwd)}`,
       ];
       ctx.ui.notify(lines.join("\n"), "info");
@@ -300,6 +341,44 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
         }
       }
       ctx.ui.notify(copied.length > 0 ? `Installed agents to ${targetDir}: ${copied.join(", ")}` : `No agent resources found at ${sourceDir}`, copied.length > 0 ? "info" : "warning");
+    },
+  });
+
+  pi.registerCommand("cc-rollover", {
+    description: "Create or use a handoff, then open a fresh Pi session and auto-resume from it",
+    handler: async (args, ctx) => {
+      refreshState(activeCwd);
+
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      const handoffPath = args?.trim()
+        ? resolveMaybeRelative(activeCwd, args.trim())
+        : createHandoffFromSession({
+            cwd: activeCwd,
+            config: configInfo.config,
+            sessionFile,
+            description: "manual-rollover",
+          }).path;
+
+      const resumePrompt = `${buildResumePrompt(handoffPath)}\n\nHandoff path: ${handoffPath}`;
+      saveRolloverGuard({ expiresAt: Date.now() + configInfo.config.autoRollover.cooldownMs });
+
+      const result = await ctx.newSession({
+        parentSession: sessionFile ?? undefined,
+        setup: async (sm) => {
+          sm.appendMessage({
+            role: "user",
+            content: [{ type: "text", text: resumePrompt }],
+            timestamp: Date.now(),
+          });
+        },
+      });
+
+      if (result.cancelled) {
+        ctx.ui.notify("Continuous Claude Pi rollover cancelled.", "warning");
+        return;
+      }
+
+      ctx.ui.notify(`Continuous Claude Pi opened a fresh session from ${handoffPath}`, "info");
     },
   });
 

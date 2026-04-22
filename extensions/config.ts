@@ -23,6 +23,11 @@ export interface ContinuousClaudePiConfig {
   fastedit: {
     enabled: boolean;
   };
+  autoRollover: {
+    enabled: boolean;
+    thresholdTokens: number;
+    cooldownMs: number;
+  };
 }
 
 export const DEFAULT_CONFIG: ContinuousClaudePiConfig = {
@@ -45,6 +50,11 @@ export const DEFAULT_CONFIG: ContinuousClaudePiConfig = {
   fastedit: {
     enabled: true,
   },
+  autoRollover: {
+    enabled: true,
+    thresholdTokens: 160_000,
+    cooldownMs: 60_000,
+  },
 };
 
 export function getGlobalConfigPath(): string {
@@ -58,19 +68,21 @@ export function getProjectConfigPath(cwd: string): string {
 export function loadConfig(cwd: string): { config: ContinuousClaudePiConfig; path: string } {
   const globalPath = getGlobalConfigPath();
   const projectPath = getProjectConfigPath(cwd);
-  const base = readJsonFile<ContinuousClaudePiConfig>(globalPath, DEFAULT_CONFIG);
+  const global = readJsonFile<Partial<ContinuousClaudePiConfig>>(globalPath, {});
   const project = existsSync(projectPath) ? readJsonFile<Partial<ContinuousClaudePiConfig>>(projectPath, {}) : {};
 
   return {
     path: existsSync(projectPath) ? projectPath : globalPath,
     config: {
-      ...base,
+      ...DEFAULT_CONFIG,
+      ...global,
       ...project,
-      storage: { ...base.storage, ...project.storage },
-      thresholds: { ...base.thresholds, ...project.thresholds },
-      readAssist: { ...base.readAssist, ...project.readAssist },
-      diagnostics: { ...base.diagnostics, ...project.diagnostics },
-      fastedit: { ...base.fastedit, ...project.fastedit },
+      storage: { ...DEFAULT_CONFIG.storage, ...global.storage, ...project.storage },
+      thresholds: { ...DEFAULT_CONFIG.thresholds, ...global.thresholds, ...project.thresholds },
+      readAssist: { ...DEFAULT_CONFIG.readAssist, ...global.readAssist, ...project.readAssist },
+      diagnostics: { ...DEFAULT_CONFIG.diagnostics, ...global.diagnostics, ...project.diagnostics },
+      fastedit: { ...DEFAULT_CONFIG.fastedit, ...global.fastedit, ...project.fastedit },
+      autoRollover: { ...DEFAULT_CONFIG.autoRollover, ...global.autoRollover, ...project.autoRollover },
     },
   };
 }
@@ -91,4 +103,8 @@ export function getThoughtsSharedRoot(cwd: string, config: ContinuousClaudePiCon
 
 export function getHandoffBaseDir(cwd: string, config: ContinuousClaudePiConfig): string {
   return resolve(dirname(getThoughtsSharedRoot(cwd, config)), "shared", "handoffs");
+}
+
+export function getAutoRolloverGuardPath(): string {
+  return join(getAgentDir(), "continuous-claude-pi-rollover-guard.json");
 }

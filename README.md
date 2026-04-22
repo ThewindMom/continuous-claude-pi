@@ -76,6 +76,7 @@ These do **not** block package startup in v1, but some research flows will be de
 - `/cc-setup` — ensure config + migrate RustDex references
 - `/cc-migrate-rustdex` — remove `pi-rustdex` entries from Pi settings
 - `/cc-create-handoff [description]` — create a handoff for the current session
+- `/cc-rollover [handoff-path]` — open a fresh session seeded from a handoff (creates one automatically if omitted)
 - `/cc-install-agents` — install bundled worker/oracle markdown agents into `~/.pi/agent/agents`
 
 ### Custom tools exposed to the model
@@ -137,6 +138,7 @@ Current defaults include:
 - read-assist line limits
 - diagnostics enablement
 - FastEdit enablement
+- auto-rollover enablement, threshold, and cooldown
 
 ## RustDex migration
 
@@ -170,6 +172,21 @@ Recommended mental model:
 - Serena performs exact symbol-aware edits
 - TLDR provides structural/semantic/impact analysis
 - Continuous Claude Pi orchestrates the higher-level workflow
+
+## Automatic handoff rollover
+
+This package can now roll into a fresh Pi session automatically.
+
+Flow:
+- current session crosses the configured auto-rollover threshold
+- extension writes a handoff automatically
+- extension sends `/cc-rollover <handoff>` as an internal follow-up user message
+- `/cc-rollover` opens a fresh session and seeds it with a user resume prompt based on the handoff
+
+Default auto-rollover config:
+- enabled: `true`
+- threshold: `160000` tokens
+- cooldown: `60000` ms
 
 ## Validation plan
 
