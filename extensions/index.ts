@@ -76,6 +76,21 @@ function registerGenericCliTool(pi: ExtensionAPI, options: { name: string; binar
 }
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const CC_ROLLOVER_GLOBAL_KEY = Symbol.for("continuous-claude-pi-rollover-pending");
+
+type PendingGlobalRollover = { prompt: string } | null;
+
+function getPendingRolloverGlobal(): PendingGlobalRollover {
+  return (globalThis as Record<PropertyKey, unknown>)[CC_ROLLOVER_GLOBAL_KEY] as PendingGlobalRollover ?? null;
+}
+
+function setPendingRolloverGlobal(data: PendingGlobalRollover) {
+  if (data) {
+    (globalThis as Record<PropertyKey, unknown>)[CC_ROLLOVER_GLOBAL_KEY] = data;
+  } else {
+    delete (globalThis as Record<PropertyKey, unknown>)[CC_ROLLOVER_GLOBAL_KEY];
+  }
+}
 
 export default function continuousClaudePiExtension(pi: ExtensionAPI) {
   let activeCwd = process.cwd();
@@ -83,6 +98,8 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
   let configInfo = loadConfig(activeCwd);
   const processedDiagnosticsToolCalls = new Set<string>();
   const autoRolledOverSessions = new Set<string>();
+  let pendingAutoRollover: { prompt: string; parentSession: string | undefined; handoffPath: string } | null = null;
+  let rolloverTimestamp: number | null = null;
 
   function refreshState(cwd: string) {
     activeCwd = cwd;
@@ -101,6 +118,10 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
   function buildResumePrompt(handoffPath: string): string {
     const prompt = readNextSessionPromptFromHandoff(handoffPath);
     return prompt ?? `Resume from handoff ${handoffPath}. Read it first, then continue autonomously from the next bounded step.`;
+  }
+
+  function buildRolloverPrompt(handoffPath: string): string {
+    return `${buildResumePrompt(handoffPath)}\n\nHandoff path: ${handoffPath}`;
   }
 
   function shouldAutoRollover(sessionFile: string | undefined, tokens: number | undefined): sessionFile is string {
@@ -123,14 +144,6 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
     return handoff;
   }
 
-  function queueRolloverCommand(handoffPath: string, deliverAs?: "steer" | "followUp") {
-    if (deliverAs) {
-      pi.sendUserMessage(`/cc-rollover ${handoffPath}`, { deliverAs });
-      return;
-    }
-    pi.sendUserMessage(`/cc-rollover ${handoffPath}`);
-  }
-
   function setFooterStatus(ctx: { ui?: { setStatus?: (key: string, value?: string) => void } }) {
     const requiredOkay = dependencyStatus.missingRequired.length === 0;
     const statusText = requiredOkay
@@ -145,8 +158,9 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
     ctx.ui?.setStatus?.("continuous-claude-pi-flow", flowText || undefined);
   }
 
-  pi.on("session_start", async (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     refreshState(ctx.cwd);
+    rolloverTimestamp = null;
     setFooterStatus(ctx);
     if (dependencyStatus.missingRequired.length > 0) {
       ctx.ui.notify(`continuous-claude-pi missing required dependencies: ${dependencyStatus.missingRequired.join(", ")}`, "warning");
@@ -155,6 +169,13 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
       ctx.ui.notify(warning, "warning");
     }
 
+    if (event.reason === "new") {
+      const pending = getPendingRolloverGlobal();
+      if (pending) {
+        setPendingRolloverGlobal(null);
+        pi.sendUserMessage(pending.prompt);
+      }
+    }
   });
 
   pi.on("input", async (event, ctx) => {
@@ -192,18 +213,38 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
     if (!shouldAutoRollover(sessionFile, usage?.tokens)) return;
 
     const handoff = prepareAutoRollover(sessionFile);
-    ctx.ui.notify(`Continuous Claude Pi auto-rollover queued before compaction: ${handoff.path}`, "warning");
-    queueRolloverCommand(handoff.path, "steer");
+    pendingAutoRollover = {
+      prompt: buildRolloverPrompt(handoff.path),
+      parentSession: sessionFile,
+      handoffPath: handoff.path,
+    };
+    ctx.ui.notify(`Continuous Claude Pi auto-rollover armed before compaction: ${handoff.path}`, "warning");
   });
 
   pi.on("agent_end", async (_event, ctx) => {
-    const sessionFile = ctx.sessionManager.getSessionFile();
-    const usage = ctx.getContextUsage();
-    if (!shouldAutoRollover(sessionFile, usage?.tokens)) return;
+    if (!pendingAutoRollover) {
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      const usage = ctx.getContextUsage();
+      if (shouldAutoRollover(sessionFile, usage?.tokens)) {
+        const handoff = prepareAutoRollover(sessionFile);
+        pendingAutoRollover = {
+          prompt: buildRolloverPrompt(handoff.path),
+          parentSession: sessionFile,
+          handoffPath: handoff.path,
+        };
+      }
+    }
 
-    const handoff = prepareAutoRollover(sessionFile);
-    ctx.ui.notify(`Continuous Claude Pi auto-rollover: created ${handoff.path}`, "warning");
-    queueRolloverCommand(handoff.path);
+    if (!pendingAutoRollover) return;
+
+    const { prompt, parentSession, handoffPath } = pendingAutoRollover;
+    pendingAutoRollover = null;
+    rolloverTimestamp = Date.now();
+    (ctx.sessionManager as any).newSession({ parentSession });
+    setTimeout(() => {
+      pi.sendUserMessage(prompt);
+    }, 0);
+    ctx.ui.notify(`Continuous Claude Pi opened fresh session from ${handoffPath}`, "info");
   });
 
   pi.on("tool_call", async (event) => {
@@ -236,6 +277,15 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
 
   pi.on("tool_result", async (_event, _ctx) => {
     return {};
+  });
+
+  pi.on("context", async (event) => {
+    const cutoff = rolloverTimestamp;
+    if (cutoff === null) return;
+    const messages = event.messages.filter((m: any) => (m?.timestamp ?? 0) >= cutoff);
+    if (messages.length > 0) {
+      return { messages };
+    }
   });
 
   pi.on("context", async (event) => {
@@ -296,10 +346,16 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (!sessionFile) return {};
     try {
-      if (shouldAutoRollover(sessionFile, event.preparation?.tokensBefore)) {
-        const handoff = prepareAutoRollover(sessionFile);
-        ctx.ui.notify(`Continuous Claude Pi cancelled compaction and queued rollover: ${handoff.path}`, "warning");
-        queueRolloverCommand(handoff.path, "followUp");
+      if (pendingAutoRollover || shouldAutoRollover(sessionFile, event.preparation?.tokensBefore)) {
+        if (!pendingAutoRollover) {
+          const handoff = prepareAutoRollover(sessionFile);
+          pendingAutoRollover = {
+            prompt: buildRolloverPrompt(handoff.path),
+            parentSession: sessionFile,
+            handoffPath: handoff.path,
+          };
+        }
+        ctx.ui.notify(`Continuous Claude Pi cancelled compaction and will roll over into a new session.`, "warning");
         return { cancel: true };
       }
 
@@ -410,26 +466,19 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
             description: "manual-rollover",
           }).path;
 
-      const resumePrompt = `${buildResumePrompt(handoffPath)}\n\nHandoff path: ${handoffPath}`;
+      const resumePrompt = buildRolloverPrompt(handoffPath);
       saveRolloverGuard({ expiresAt: Date.now() + configInfo.config.autoRollover.cooldownMs });
+      setPendingRolloverGlobal({ prompt: resumePrompt });
 
       const result = await ctx.newSession({
         parentSession: sessionFile ?? undefined,
-        setup: async (sm) => {
-          sm.appendMessage({
-            role: "user",
-            content: [{ type: "text", text: resumePrompt }],
-            timestamp: Date.now(),
-          });
-        },
       });
 
       if (result.cancelled) {
+        setPendingRolloverGlobal(null);
         ctx.ui.notify("Continuous Claude Pi rollover cancelled.", "warning");
         return;
       }
-
-      ctx.ui.notify(`Continuous Claude Pi opened a fresh session from ${handoffPath}`, "info");
     },
   });
 
