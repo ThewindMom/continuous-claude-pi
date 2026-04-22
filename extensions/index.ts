@@ -2,8 +2,9 @@ import { existsSync, readFileSync, readdirSync, statSync, copyFileSync, mkdirSyn
 import { tmpdir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { complete, type Message } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { SessionManager, convertToLlm, getAgentDir, serializeConversation } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { DEFAULT_CONFIG, getAutoRolloverGuardPath, getProjectConfigPath, loadConfig } from "./config.js";
 import { checkDependencies, formatDependencyStatus } from "./deps.js";
@@ -25,8 +26,16 @@ const CC_COMMAND_PREFIXES = [
   "/cc-setup",
   "/cc-create-handoff",
   "/cc-install-agents",
-  "/cc-rollover",
 ] as const;
+
+const SESSION_QUERY_SYSTEM_PROMPT = `You are a session context assistant. Given the conversation history from a pi coding session and a question, provide a concise answer based on the session contents.
+
+Focus on:
+- Specific facts, decisions, and outcomes
+- File paths and code changes mentioned
+- Key context the user is asking about
+
+Be concise and direct. If the information isn't in the session, say so.`;
 
 function isCodeFile(filePath: string): boolean {
   return CODE_EXTENSIONS.has(extname(filePath));
@@ -75,22 +84,85 @@ function registerGenericCliTool(pi: ExtensionAPI, options: { name: string; binar
   });
 }
 
-const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const CC_ROLLOVER_GLOBAL_KEY = Symbol.for("continuous-claude-pi-rollover-pending");
+function buildParentSessionPrompt(basePrompt: string, parentSessionPath?: string): string {
+  const lines = [
+    "/skill:resume-handoff",
+    "",
+    basePrompt,
+  ];
 
-type PendingGlobalRollover = { prompt: string } | null;
-
-function getPendingRolloverGlobal(): PendingGlobalRollover {
-  return (globalThis as Record<PropertyKey, unknown>)[CC_ROLLOVER_GLOBAL_KEY] as PendingGlobalRollover ?? null;
-}
-
-function setPendingRolloverGlobal(data: PendingGlobalRollover) {
-  if (data) {
-    (globalThis as Record<PropertyKey, unknown>)[CC_ROLLOVER_GLOBAL_KEY] = data;
-  } else {
-    delete (globalThis as Record<PropertyKey, unknown>)[CC_ROLLOVER_GLOBAL_KEY];
+  if (parentSessionPath) {
+    lines.push(
+      "",
+      `Parent session: \`${parentSessionPath}\``,
+      "Use `cc_session_query` to inspect the parent session for detailed decisions, files, and prior reasoning when needed.",
+    );
   }
+
+  return lines.join("\n");
 }
+
+async function answerSessionQuery(
+  ctx: any,
+  sessionPath: string,
+  question: string,
+  signal?: AbortSignal,
+): Promise<{ text: string; details: Record<string, unknown> }> {
+  const sessionManager = SessionManager.open(sessionPath);
+  const branch = sessionManager.getBranch();
+  const messages = branch
+    .filter((entry: any) => entry.type === "message")
+    .map((entry: any) => entry.message);
+
+  if (messages.length === 0) {
+    return { text: "Session is empty - no messages found.", details: { empty: true, sessionPath } };
+  }
+
+  let queryModel = ctx.model;
+  const modelChanges = branch.filter((entry: any) => entry.type === "model_change") as any[];
+  if (modelChanges.length > 0) {
+    const lastChange = modelChanges[modelChanges.length - 1];
+    const sessionModel = ctx.modelRegistry.find(lastChange.provider, lastChange.modelId);
+    if (sessionModel) queryModel = sessionModel;
+  }
+  if (!queryModel) {
+    throw new Error("No model available to analyze the session.");
+  }
+
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(queryModel);
+  if (!auth.ok) {
+    throw new Error(auth.error);
+  }
+
+  const conversationText = serializeConversation(convertToLlm(messages));
+  const userMessage: Message = {
+    role: "user",
+    content: [{ type: "text", text: `## Session Conversation\n\n${conversationText}\n\n## Question\n\n${question}` }],
+    timestamp: Date.now(),
+  };
+
+  const response = await complete(
+    queryModel,
+    { systemPrompt: SESSION_QUERY_SYSTEM_PROMPT, messages: [userMessage] },
+    { apiKey: auth.apiKey, headers: auth.headers, signal },
+  );
+
+  if (response.stopReason === "aborted") {
+    return { text: "Query was cancelled.", details: { cancelled: true, sessionPath, question } };
+  }
+
+  const answer = response.content
+    .filter((c): c is { type: "text"; text: string } => c.type === "text")
+    .map((c) => c.text)
+    .join("\n");
+
+  return {
+    text: `**Query:** ${question}\n\n---\n\n${answer}`,
+    details: { sessionPath, question, messageCount: messages.length },
+  };
+}
+
+const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 export default function continuousClaudePiExtension(pi: ExtensionAPI) {
   let activeCwd = process.cwd();
@@ -120,8 +192,9 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
     return prompt ?? `Resume from handoff ${handoffPath}. Read it first, then continue autonomously from the next bounded step.`;
   }
 
-  function buildRolloverPrompt(handoffPath: string): string {
-    return `${buildResumePrompt(handoffPath)}\n\nHandoff path: ${handoffPath}`;
+  function buildRolloverPrompt(handoffPath: string, parentSessionPath?: string): string {
+    const basePrompt = `${buildResumePrompt(handoffPath)}\n\nHandoff path: ${handoffPath}`;
+    return buildParentSessionPrompt(basePrompt, parentSessionPath);
   }
 
   function shouldAutoRollover(sessionFile: string | undefined, tokens: number | undefined): sessionFile is string {
@@ -169,13 +242,6 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
       ctx.ui.notify(warning, "warning");
     }
 
-    if (event.reason === "new") {
-      const pending = getPendingRolloverGlobal();
-      if (pending) {
-        setPendingRolloverGlobal(null);
-        pi.sendUserMessage(pending.prompt);
-      }
-    }
   });
 
   pi.on("input", async (event, ctx) => {
@@ -214,7 +280,7 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
 
     const handoff = prepareAutoRollover(sessionFile);
     pendingAutoRollover = {
-      prompt: buildRolloverPrompt(handoff.path),
+      prompt: buildRolloverPrompt(handoff.path, sessionFile),
       parentSession: sessionFile,
       handoffPath: handoff.path,
     };
@@ -228,7 +294,7 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
       if (shouldAutoRollover(sessionFile, usage?.tokens)) {
         const handoff = prepareAutoRollover(sessionFile);
         pendingAutoRollover = {
-          prompt: buildRolloverPrompt(handoff.path),
+          prompt: buildRolloverPrompt(handoff.path, sessionFile),
           parentSession: sessionFile,
           handoffPath: handoff.path,
         };
@@ -350,7 +416,7 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
         if (!pendingAutoRollover) {
           const handoff = prepareAutoRollover(sessionFile);
           pendingAutoRollover = {
-            prompt: buildRolloverPrompt(handoff.path),
+            prompt: buildRolloverPrompt(handoff.path, sessionFile),
             parentSession: sessionFile,
             handoffPath: handoff.path,
           };
@@ -451,34 +517,31 @@ export default function continuousClaudePiExtension(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("cc-rollover", {
-    description: "Create or use a handoff, then open a fresh Pi session and auto-resume from it",
-    handler: async (args, ctx) => {
-      refreshState(activeCwd);
+  pi.registerTool({
+    name: "cc_session_query",
+    label: "cc_session_query",
+    description: "Query a previous Continuous Claude Pi session file for context, decisions, or information.",
+    parameters: Type.Object({
+      sessionPath: Type.String({ description: "Full path to the session file (.jsonl)" }),
+      question: Type.String({ description: "What you want to know about that session" }),
+    }),
+    async execute(_toolCallId, params: any, signal, onUpdate, ctx) {
+      const sessionPath = params.sessionPath;
+      const question = params.question;
+      if (typeof sessionPath !== "string" || !sessionPath.endsWith(".jsonl")) {
+        throw new Error(`Invalid session path: ${sessionPath}`);
+      }
+      if (!existsSync(sessionPath)) {
+        throw new Error(`Session file not found: ${sessionPath}`);
+      }
 
-      const sessionFile = ctx.sessionManager.getSessionFile();
-      const handoffPath = args?.trim()
-        ? resolveMaybeRelative(activeCwd, args.trim())
-        : createHandoffFromSession({
-            cwd: activeCwd,
-            config: configInfo.config,
-            sessionFile,
-            description: "manual-rollover",
-          }).path;
-
-      const resumePrompt = buildRolloverPrompt(handoffPath);
-      saveRolloverGuard({ expiresAt: Date.now() + configInfo.config.autoRollover.cooldownMs });
-      setPendingRolloverGlobal({ prompt: resumePrompt });
-
-      const result = await ctx.newSession({
-        parentSession: sessionFile ?? undefined,
+      onUpdate?.({
+        content: [{ type: "text", text: `Query: ${question}` }],
+        details: { status: "loading", question },
       });
 
-      if (result.cancelled) {
-        setPendingRolloverGlobal(null);
-        ctx.ui.notify("Continuous Claude Pi rollover cancelled.", "warning");
-        return;
-      }
+      const result = await answerSessionQuery(ctx, sessionPath, question, signal);
+      return { content: [{ type: "text", text: result.text }], details: result.details };
     },
   });
 

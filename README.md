@@ -76,7 +76,6 @@ These do **not** block package startup in v1, but some research flows will be de
 - `/cc-setup` — ensure config + migrate RustDex references
 - `/cc-migrate-rustdex` — remove `pi-rustdex` entries from Pi settings
 - `/cc-create-handoff [description]` — create a handoff for the current session
-- `/cc-rollover [handoff-path]` — open a fresh session seeded from a handoff (creates one automatically if omitted)
 - `/cc-install-agents` — install bundled worker/oracle markdown agents into `~/.pi/agent/agents`
 
 ### Custom tools exposed to the model
@@ -87,6 +86,7 @@ These do **not** block package startup in v1, but some research flows will be de
 - `cc_ouros`
 - `cc_fastedit`
 - `cc_create_handoff`
+- `cc_session_query`
 
 ## Workflow surface
 
@@ -180,8 +180,9 @@ This package can now roll into a fresh Pi session automatically.
 Flow:
 - current session crosses the configured auto-rollover threshold
 - extension writes a handoff automatically
-- extension sends `/cc-rollover <handoff>` as an internal follow-up user message
-- `/cc-rollover` opens a fresh session and seeds it with a user resume prompt based on the handoff
+- extension opens a fresh session directly
+- new session is seeded with the handoff prompt plus parent-session reference
+- resumed work can inspect the prior session with `cc_session_query`
 
 Default auto-rollover config:
 - enabled: `true`
