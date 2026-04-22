@@ -1,0 +1,94 @@
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { readJsonFile, writeJsonFile } from "./utils.js";
+
+export interface ContinuousClaudePiConfig {
+  storage: {
+    continuumRoot: string;
+    thoughtsSharedRoot: string;
+  };
+  thresholds: {
+    warnTokens: number;
+    criticalTokens: number;
+  };
+  readAssist: {
+    enabled: boolean;
+    lineLimit: number;
+    smallFileBytes: number;
+  };
+  diagnostics: {
+    enabled: boolean;
+  };
+  fastedit: {
+    enabled: boolean;
+  };
+}
+
+export const DEFAULT_CONFIG: ContinuousClaudePiConfig = {
+  storage: {
+    continuumRoot: "continuum",
+    thoughtsSharedRoot: join("thoughts", "shared"),
+  },
+  thresholds: {
+    warnTokens: 120_000,
+    criticalTokens: 160_000,
+  },
+  readAssist: {
+    enabled: true,
+    lineLimit: 200,
+    smallFileBytes: 1500,
+  },
+  diagnostics: {
+    enabled: true,
+  },
+  fastedit: {
+    enabled: true,
+  },
+};
+
+export function getGlobalConfigPath(): string {
+  return join(getAgentDir(), "continuous-claude-pi.json");
+}
+
+export function getProjectConfigPath(cwd: string): string {
+  return resolve(cwd, ".pi", "continuous-claude-pi.json");
+}
+
+export function loadConfig(cwd: string): { config: ContinuousClaudePiConfig; path: string } {
+  const globalPath = getGlobalConfigPath();
+  const projectPath = getProjectConfigPath(cwd);
+  const base = readJsonFile<ContinuousClaudePiConfig>(globalPath, DEFAULT_CONFIG);
+  const project = existsSync(projectPath) ? readJsonFile<Partial<ContinuousClaudePiConfig>>(projectPath, {}) : {};
+
+  return {
+    path: existsSync(projectPath) ? projectPath : globalPath,
+    config: {
+      ...base,
+      ...project,
+      storage: { ...base.storage, ...project.storage },
+      thresholds: { ...base.thresholds, ...project.thresholds },
+      readAssist: { ...base.readAssist, ...project.readAssist },
+      diagnostics: { ...base.diagnostics, ...project.diagnostics },
+      fastedit: { ...base.fastedit, ...project.fastedit },
+    },
+  };
+}
+
+export function saveGlobalConfig(config: ContinuousClaudePiConfig): string {
+  const path = getGlobalConfigPath();
+  writeJsonFile(path, config);
+  return path;
+}
+
+export function getContinuumRoot(cwd: string, config: ContinuousClaudePiConfig): string {
+  return resolve(cwd, config.storage.continuumRoot);
+}
+
+export function getThoughtsSharedRoot(cwd: string, config: ContinuousClaudePiConfig): string {
+  return resolve(cwd, config.storage.thoughtsSharedRoot);
+}
+
+export function getHandoffBaseDir(cwd: string, config: ContinuousClaudePiConfig): string {
+  return resolve(dirname(getThoughtsSharedRoot(cwd, config)), "shared", "handoffs");
+}

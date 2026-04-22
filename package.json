@@ -1,0 +1,57 @@
+{
+  "name": "@thewindmom/continuous-claude-pi",
+  "version": "0.1.0",
+  "description": "Pi-native port of ContinuousClaude v4.7 with TLDR, Ouros, FastEdit, bloks, handoffs, and autonomous workflows.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "continuous-claude",
+    "continuousclaude",
+    "tldr",
+    "ouros",
+    "fastedit",
+    "autonomous",
+    "subagents"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ThewindMom/continuous-claude-pi.git"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "prompts": [
+      "./prompts"
+    ]
+  },
+  "files": [
+    "extensions",
+    "skills",
+    "prompts",
+    "resources",
+    "scripts",
+    ".github",
+    "README.md",
+    "LICENSE",
+    "tsconfig.json",
+    "package.json"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@sinclair/typebox": "*",
+    "typescript": "^5.9.2"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  }
+}
